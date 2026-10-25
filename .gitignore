@@ -1,0 +1,40 @@
+# --- secrets: never commit these ---
+.env
+.env.*
+**/.env
+**/.env.*
+token.json
+credentials.json
+client_secret*.json
+
+# --- Python environments and caches ---
+meetmate-env/
+meetmate-backend/
+**/meetmate-env/
+__pycache__/
+*.pyc
+
+# --- Node ---
+node_modules/
+dist/
+
+# --- recordings, transcripts and work files (private data) ---
+*.wav
+*.mp3
+*.m4a
+*.aac
+*.ogg
+*.flac
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.avi
+*_transcript.txt
+*_transcript.json
+transcript.txt
+summary.json
+uploads/
+debug_tile_*.jpg
+temp_*
+frame_*.jpg
