@@ -38,3 +38,5 @@ uploads/
 debug_tile_*.jpg
 temp_*
 frame_*.jpg
+backend-env/
+.venv/

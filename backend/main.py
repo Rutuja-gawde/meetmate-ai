@@ -11,10 +11,17 @@ How it works
 4. If the built website exists in ../frontend/dist, this server also serves it,
    so one address (and one tunnel) is enough to share the whole app.
 
+Who gets what
+-------------
+    guest  - anyone with ACCESS_CODE (or anyone, if ACCESS_CODE is empty). Gets the
+             minutes on screen only. Nothing is ever sent to your accounts.
+    owner  - whoever types OWNER_CODE. Gets the same, AND the results are also pushed to
+             Notion, Slack, Google Calendar and Gmail (your accounts). Keep this code secret.
+
 Settings (backend/.env) - all optional:
-    ACCESS_CODE=             # anyone using the app must type this. REQUIRED when public.
-    ENABLE_INTEGRATIONS=0    # 1 = also push to Notion/Slack/Calendar/Gmail (your accounts!)
-    EMAIL_RECIPIENTS=        # only used when integrations are on
+    ACCESS_CODE=             # the code you give to other people. REQUIRED when public.
+    OWNER_CODE=              # your own code: turns on Notion/Slack/Calendar/Gmail for you
+    EMAIL_RECIPIENTS=        # who receives the minutes email for owner jobs
     MAX_UPLOAD_MB=90         # Cloudflare's free plan rejects uploads over 100 MB
     MAX_QUEUED_JOBS=3        # how many recordings may wait; more get "server busy"
     RESULT_TTL_MINUTES=60    # how long finished results stay available
@@ -60,7 +67,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 ACCESS_CODE = os.getenv("ACCESS_CODE", "").strip()
-ENABLE_INTEGRATIONS = os.getenv("ENABLE_INTEGRATIONS", "0").strip() == "1"
+OWNER_CODE = os.getenv("OWNER_CODE", "").strip()
 MAX_UPLOAD_MB = _env_int("MAX_UPLOAD_MB", 90)
 MAX_QUEUED_JOBS = _env_int("MAX_QUEUED_JOBS", 3)
 RESULT_TTL_MINUTES = _env_int("RESULT_TTL_MINUTES", 60)
@@ -79,28 +86,42 @@ ALLOWED_EXTENSIONS = {
 }
 
 if not ACCESS_CODE:
-    print("[main] NOTE: no ACCESS_CODE is set, so anyone who can reach this server can use it. "
-          "Set ACCESS_CODE in backend/.env before sharing a public link.", flush=True)
-if ENABLE_INTEGRATIONS:
-    print("[main] Integrations are ON: results are sent to the Notion, Slack, Calendar and Gmail "
-          "accounts configured on this machine.", flush=True)
+    print("[main] NOTE: no ACCESS_CODE is set, so anyone who can reach this server can use it "
+          "(as a guest, without any sync to your accounts). Set ACCESS_CODE in backend/.env "
+          "before sharing a public link.", flush=True)
+if OWNER_CODE:
+    print("[main] OWNER_CODE is set: jobs started with it are also sent to the Notion, Slack, "
+          "Calendar and Gmail accounts configured on this machine.", flush=True)
+    if OWNER_CODE == ACCESS_CODE:
+        print("[main] WARNING: OWNER_CODE and ACCESS_CODE are the same, so everyone who has the "
+              "access code counts as the owner. Use two different codes.", flush=True)
 
 
-def _access_ok(code) -> bool:
+def _same(a: str, b: str) -> bool:
+    return secrets.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
+
+def _role(code):
+    """'owner' (results are also synced to your accounts), 'guest' (results on screen only),
+    or None (not allowed)."""
+    if OWNER_CODE and code and _same(code, OWNER_CODE):
+        return "owner"
     if not ACCESS_CODE:
-        return True
-    if not code:
-        return False
-    return secrets.compare_digest(code.encode("utf-8"), ACCESS_CODE.encode("utf-8"))
+        return "guest"
+    if code and _same(code, ACCESS_CODE):
+        return "guest"
+    return None
 
 
-def _check_access(code) -> None:
-    if not _access_ok(code):
+def _check_access(code) -> str:
+    role = _role(code)
+    if role is None:
         raise HTTPException(status_code=401, detail="Wrong or missing access code.")
+    return role
 
 
 # ---------------------------------------------------------------------------
-# Integrations (only used when ENABLE_INTEGRATIONS=1)
+# Integrations (only used for jobs started with OWNER_CODE)
 # ---------------------------------------------------------------------------
 
 # A call that hangs keeps its thread busy until it returns, so the pool is larger
@@ -160,7 +181,7 @@ def _purge_old_jobs() -> None:
             del jobs[jid]
 
 
-def _process(job_id: str, path: str, filename: str) -> None:
+def _process(job_id: str, path: str, filename: str, integrations: bool) -> None:
     started = time.perf_counter()
     try:
         transcript = run_transcription(path)
@@ -175,7 +196,7 @@ def _process(job_id: str, path: str, filename: str) -> None:
 
         automation_status = []
         automation_time = 0.0
-        if ENABLE_INTEGRATIONS:
+        if integrations:
             _set_job(job_id, stage="syncing")
             stage_start = time.perf_counter()
             meeting_title = os.path.splitext(filename)[0]
@@ -229,7 +250,8 @@ def _worker() -> None:
             job["status"] = "running"
             job["stage"] = "transcribing"
             path, filename = job["path"], job["filename"]
-        _process(job_id, path, filename)
+            integrations = job["integrations"]
+        _process(job_id, path, filename, integrations)
 
 
 threading.Thread(target=_worker, name="meetmate-worker", daemon=True).start()
@@ -247,7 +269,7 @@ async def reject_bad_uploads_early(request: Request, call_next):
     """Checks the access code and the declared size BEFORE the upload body is read,
     so strangers and oversized files are turned away cheaply."""
     if request.method == "POST" and request.url.path == "/jobs":
-        if not _access_ok(request.headers.get("x-access-code")):
+        if _role(request.headers.get("x-access-code")) is None:
             return JSONResponse({"detail": "Wrong or missing access code."}, status_code=401)
         declared = request.headers.get("content-length")
         if declared and declared.isdigit() and int(declared) > (MAX_UPLOAD_MB + 5) * 1024 * 1024:
@@ -277,14 +299,14 @@ def public_config():
     """What the website needs to know before showing the upload form."""
     return {
         "requires_code": bool(ACCESS_CODE),
+        "accepts_code": bool(ACCESS_CODE or OWNER_CODE),
         "max_upload_mb": MAX_UPLOAD_MB,
-        "integrations_enabled": ENABLE_INTEGRATIONS,
     }
 
 
 @app.post("/jobs", status_code=202)
 async def create_job(file: UploadFile, x_access_code: str | None = Header(default=None)):
-    _check_access(x_access_code)
+    role = _check_access(x_access_code)
     _purge_old_jobs()
 
     filename = os.path.basename(file.filename or "recording")
@@ -331,6 +353,7 @@ async def create_job(file: UploadFile, x_access_code: str | None = Header(defaul
         jobs[job_id] = {
             "status": "queued",
             "stage": "waiting",
+            "integrations": role == "owner",
             "filename": filename,
             "path": str(destination),
             "created": time.time(),
@@ -341,7 +364,7 @@ async def create_job(file: UploadFile, x_access_code: str | None = Header(defaul
         pending.append(job_id)
         work_available.notify()
 
-    return {"job_id": job_id}
+    return {"job_id": job_id, "integrations": role == "owner"}
 
 
 @app.get("/jobs/{job_id}")
@@ -356,6 +379,7 @@ def get_job(job_id: str, x_access_code: str | None = Header(default=None)):
         payload = {
             "status": job["status"],
             "stage": job["stage"],
+            "integrations": job["integrations"],
             "queue_position": (list(pending).index(job_id) + 1) if job_id in pending else 0,
         }
         if job["status"] == "done":

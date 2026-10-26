@@ -171,7 +171,7 @@ function uploadRecording(file, accessCode, onProgress) {
         // response wasn't JSON
       }
       if (xhr.status >= 200 && xhr.status < 300 && body.job_id) {
-        resolve(body.job_id)
+        resolve({ jobId: body.job_id, integrations: Boolean(body.integrations) })
       } else if (xhr.status === 413) {
         reject(new Error(body.detail || 'This file is too large to upload.'))
       } else {
@@ -215,11 +215,12 @@ function App() {
   const [isDragging, setIsDragging] = useState(false)
   const [mediaUrl, setMediaUrl] = useState(null)
   const [serverConfig, setServerConfig] = useState(null)
+  const [jobIntegrations, setJobIntegrations] = useState(false)
   const [accessCode, setAccessCode] = useState(readSavedCode)
   const fileInputRef = useRef(null)
   const runIdRef = useRef(0)
 
-  // Ask the server what it needs (access code, size limit, integrations).
+  // Ask the server what it needs (access code, size limit).
   useEffect(() => {
     let cancelled = false
     fetch(`${API_URL}/config`)
@@ -304,12 +305,14 @@ function App() {
     setPhase('uploading')
     setUploadPercent(0)
     setQueuePosition(0)
+    setJobIntegrations(false)
 
     try {
-      const jobId = await uploadRecording(file, code, (percent) => {
+      const { jobId, integrations } = await uploadRecording(file, code, (percent) => {
         if (stillCurrent()) setUploadPercent(percent)
       })
       if (!stillCurrent()) return
+      setJobIntegrations(integrations)
       saveCode(code)
       setPhase('queued')
 
@@ -341,6 +344,7 @@ function App() {
         failures = 0
         const data = await response.json()
         setQueuePosition(data.queue_position || 0)
+        if (data.integrations !== undefined) setJobIntegrations(Boolean(data.integrations))
 
         if (data.status === 'queued') {
           setPhase('queued')
@@ -468,10 +472,9 @@ function App() {
 
   const transcriptLines = result ? parseTranscript(result.transcript) : []
 
-  // Only show the sync step when the server actually syncs to other tools.
-  const visibleSteps = PIPELINE_STEPS.filter(
-    (step) => step.key !== 'syncing' || serverConfig?.integrations_enabled
-  )
+  // The sync step only appears for jobs that are really sent on to Notion, Slack,
+  // Calendar and Gmail (the owner's jobs). Guests never see it.
+  const visibleSteps = PIPELINE_STEPS.filter((step) => step.key !== 'syncing' || jobIntegrations)
   const activeKey = phase === 'queued' ? 'transcribing' : phase
   const activeIndex = Math.max(
     0,
@@ -524,7 +527,7 @@ function App() {
                 </div>
               )}
 
-              {serverConfig?.requires_code && (
+              {serverConfig?.accepts_code && (
                 <div style={{ width: '100%', maxWidth: 280, textAlign: 'left' }}>
                   <label
                     htmlFor="access-code"
@@ -536,7 +539,7 @@ function App() {
                       color: 'var(--ink-soft)',
                     }}
                   >
-                    Access code
+                    {serverConfig.requires_code ? 'Access code' : 'Access code (optional)'}
                   </label>
                   <input
                     id="access-code"
