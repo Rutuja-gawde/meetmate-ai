@@ -1,38 +1,34 @@
 """
 MeetMate AI - backend API
-
-How it works
-------------
-1. The website uploads a recording to POST /jobs and immediately gets a job id.
-2. A single background worker processes jobs one at a time (the GPU can only
-   do one meeting at once), so extra uploads wait in a short queue.
-3. The website asks GET /jobs/<id> every few seconds and shows the real stage:
+=========================
+1. Users sign in on the website with Supabase (Google). Every request carries their
+   login token, and this server checks it (auth.py).
+2. The website uploads a recording to POST /jobs and immediately gets a job id.
+3. A single background worker processes jobs one at a time (the GPU can only do one
+   meeting at once), so extra uploads wait in a short queue.
+4. The website asks GET /jobs/<id> every few seconds and shows the real stage:
    waiting, transcribing, summarizing, syncing, done.
-4. If the built website exists in ../frontend/dist, this server also serves it,
-   so one address (and one tunnel) is enough to share the whole app.
+5. Finished meetings are saved to the user's own history (database), and the results are
+   sent to whichever apps THAT user connected (Google Calendar + Gmail, Notion, Slack),
+   using their own credentials.
 
-Who gets what
--------------
-    guest  - anyone with ACCESS_CODE (or anyone, if ACCESS_CODE is empty). Gets the
-             minutes on screen only. Nothing is ever sent to your accounts.
-    owner  - whoever types OWNER_CODE. Gets the same, AND the results are also pushed to
-             Notion, Slack, Google Calendar and Gmail (your accounts). Keep this code secret.
-
-Settings (backend/.env) - all optional:
-    ACCESS_CODE=             # the code you give to other people. REQUIRED when public.
-    OWNER_CODE=              # your own code: turns on Notion/Slack/Calendar/Gmail for you
-    EMAIL_RECIPIENTS=        # who receives the minutes email for owner jobs
-    MAX_UPLOAD_MB=90         # Cloudflare's free plan rejects uploads over 100 MB
-    MAX_QUEUED_JOBS=3        # how many recordings may wait; more get "server busy"
-    RESULT_TTL_MINUTES=60    # how long finished results stay available
-    ALLOWED_ORIGINS=         # only if the website is hosted on a different address
+Settings (backend/.env):
+    SUPABASE_URL=                  # https://<project>.supabase.co
+    SUPABASE_SERVICE_ROLE_KEY=     # SECRET, backend only
+    SUPABASE_JWT_SECRET=           # only for projects on the legacy shared JWT secret
+    TOKEN_ENCRYPTION_KEY=          # see crypto.py
+    GOOGLE_CLIENT_ID=              # the same Google OAuth client configured in Supabase
+    GOOGLE_CLIENT_SECRET=
+    ALLOWED_ORIGINS=               # your website address(es), e.g. https://meetmate.vercel.app
+    MAX_UPLOAD_MB=90               # Cloudflare's free plan rejects uploads over 100 MB
+    MAX_QUEUED_JOBS=3              # how many recordings may wait; more get "server busy"
+    RESULT_TTL_MINUTES=60          # how long a finished job stays in memory
     UPLOAD_DIR=uploads
-    FRONTEND_DIST=           # defaults to ../frontend/dist
+    FRONTEND_DIST=                 # optional: also serve a built website from this server
 """
 
 import json
 import os
-import secrets
 import threading
 import time
 import traceback
@@ -42,17 +38,22 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, Request, UploadFile
+
+load_dotenv()  # must run before the modules below read their settings
+
+from fastapi import Depends, FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
+import db
+from auth import current_user, user_from_authorization
 from task_agent import structure_tasks
-from automation_agent import push_to_notion, push_to_slack
+from automation_agent import push_to_notion, push_to_slack, check_notion, send_slack_test
 from google_agent import push_to_calendar, send_summary_email, build_summary_email
 from orchestrator import run_transcription, run_summarization
-
-load_dotenv()
+from participants import clean_participants
 
 
 # ---------------------------------------------------------------------------
@@ -66,10 +67,9 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-ACCESS_CODE = os.getenv("ACCESS_CODE", "").strip()
-OWNER_CODE = os.getenv("OWNER_CODE", "").strip()
 MAX_UPLOAD_MB = _env_int("MAX_UPLOAD_MB", 90)
 MAX_QUEUED_JOBS = _env_int("MAX_QUEUED_JOBS", 3)
+MAX_JOBS_PER_USER = _env_int("MAX_JOBS_PER_USER", 1)  # waiting + running at once
 RESULT_TTL_MINUTES = _env_int("RESULT_TTL_MINUTES", 60)
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads"))
 ALLOWED_ORIGINS = [
@@ -85,53 +85,13 @@ ALLOWED_EXTENSIONS = {
     ".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac",
 }
 
-if not ACCESS_CODE:
-    print("[main] NOTE: no ACCESS_CODE is set, so anyone who can reach this server can use it "
-          "(as a guest, without any sync to your accounts). Set ACCESS_CODE in backend/.env "
-          "before sharing a public link.", flush=True)
-if OWNER_CODE:
-    print("[main] OWNER_CODE is set: jobs started with it are also sent to the Notion, Slack, "
-          "Calendar and Gmail accounts configured on this machine.", flush=True)
-    if OWNER_CODE == ACCESS_CODE:
-        print("[main] WARNING: OWNER_CODE and ACCESS_CODE are the same, so everyone who has the "
-              "access code counts as the owner. Use two different codes.", flush=True)
-
-
-def _same(a: str, b: str) -> bool:
-    return secrets.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
-
-
-def _role(code):
-    """'owner' (results are also synced to your accounts), 'guest' (results on screen only),
-    or None (not allowed)."""
-    if OWNER_CODE and code and _same(code, OWNER_CODE):
-        return "owner"
-    if not ACCESS_CODE:
-        return "guest"
-    if code and _same(code, ACCESS_CODE):
-        return "guest"
-    return None
-
-
-def _check_access(code) -> str:
-    role = _role(code)
-    if role is None:
-        raise HTTPException(status_code=401, detail="Wrong or missing access code.")
-    return role
-
-
 # ---------------------------------------------------------------------------
-# Integrations (only used for jobs started with OWNER_CODE)
+# Integrations (each user's own connected apps)
 # ---------------------------------------------------------------------------
 
 # A call that hangs keeps its thread busy until it returns, so the pool is larger
 # than the number of integrations to leave room for a few stuck calls.
 _automation_pool = ThreadPoolExecutor(max_workers=8)
-
-
-def _email_recipients() -> list[str]:
-    raw = os.getenv("EMAIL_RECIPIENTS", "")
-    return [address.strip() for address in raw.split(",") if address.strip()]
 
 
 def _run_automations_parallel(jobs, timeout_seconds: int = 30):
@@ -181,10 +141,35 @@ def _purge_old_jobs() -> None:
             del jobs[jid]
 
 
-def _process(job_id: str, path: str, filename: str, integrations: bool) -> None:
+def _load_connections(user_id: str) -> dict:
+    """The apps this user connected. A database hiccup must not lose the meeting,
+    so on error the meeting is processed and simply not synced."""
+    try:
+        return db.get_connections(user_id)
+    except Exception as e:
+        print(f"[main] Could not load connections for {user_id[:8]}: {e}", flush=True)
+        return {}
+
+
+def _build_sync_jobs(connections: dict, tasks, meeting_title, email_to, email_text, email_html):
+    sync_jobs = []
+    if "notion" in connections:
+        sync_jobs.append(("notion", push_to_notion, (tasks, connections["notion"])))
+    if "slack" in connections:
+        sync_jobs.append(("slack", push_to_slack, (tasks, connections["slack"], meeting_title)))
+    if "google" in connections:
+        google = connections["google"]
+        sync_jobs.append(("calendar", push_to_calendar, (tasks, google)))
+        sync_jobs.append(("email", send_summary_email,
+                          (email_to, f"Meeting minutes: {meeting_title}", email_text, email_html, google)))
+    return sync_jobs
+
+
+def _process(job_id: str, path: str, filename: str, user: dict, participants: list[str]) -> None:
     started = time.perf_counter()
     try:
-        transcript = run_transcription(path)
+        _unload_summarizer()
+        transcript = run_transcription(path, participants)
         transcription_time = time.perf_counter() - started
 
         _set_job(job_id, stage="summarizing")
@@ -196,18 +181,15 @@ def _process(job_id: str, path: str, filename: str, integrations: bool) -> None:
 
         automation_status = []
         automation_time = 0.0
-        if integrations:
+        connections = _load_connections(user["id"])
+        if connections:
             _set_job(job_id, stage="syncing")
             stage_start = time.perf_counter()
             meeting_title = os.path.splitext(filename)[0]
             email_text, email_html = build_summary_email(meeting_title, summary_data, tasks)
-            automation_status = _run_automations_parallel([
-                ("notion", push_to_notion, (tasks,)),
-                ("slack", push_to_slack, (tasks,)),
-                ("calendar", push_to_calendar, (tasks,)),
-                ("email", send_summary_email,
-                 (_email_recipients(), f"Meeting minutes: {meeting_title}", email_text, email_html)),
-            ])
+            automation_status = _run_automations_parallel(
+                _build_sync_jobs(connections, tasks, meeting_title, user["email"], email_text, email_html)
+            )
             automation_time = time.perf_counter() - stage_start
 
         result = {
@@ -219,6 +201,11 @@ def _process(job_id: str, path: str, filename: str, integrations: bool) -> None:
             "tasks": tasks,
             "automation_status": automation_status,
         }
+        try:
+            result["meeting_id"] = db.save_meeting(user["id"], filename, result)
+        except Exception as e:
+            print(f"[main] Could not save meeting history: {e}", flush=True)
+
         _set_job(job_id, status="done", stage="done", result=result, finished=time.time())
         print(f"[main] Job {job_id[:8]} done in {time.perf_counter() - started:.0f}s "
               f"(transcription {transcription_time:.0f}s, summarization {summarization_time:.0f}s, "
@@ -249,12 +236,35 @@ def _worker() -> None:
             job = jobs[job_id]
             job["status"] = "running"
             job["stage"] = "transcribing"
-            path, filename = job["path"], job["filename"]
-            integrations = job["integrations"]
-        _process(job_id, path, filename, integrations)
+            path, filename, user = job["path"], job["filename"], job["user"]
+            participants = job["participants"]
+        _process(job_id, path, filename, user, participants)
 
 
 threading.Thread(target=_worker, name="meetmate-worker", daemon=True).start()
+
+
+def _unload_summarizer() -> None:
+    """Frees the GPU memory held by the Ollama model before transcription starts.
+
+    The speech models (pyannote + Whisper) need the GPU to themselves. On a card with less
+    than ~16 GB, a language model still sitting in memory makes Windows spill the speech
+    models into slow shared system memory, and a job that takes minutes takes half an hour.
+    The model is loaded again for the summary step (a few seconds). Set KEEP_LLM_LOADED=1
+    in backend/.env only if your GPU has plenty of memory. Best effort: errors are ignored."""
+    if os.getenv("KEEP_LLM_LOADED", "").strip() == "1":
+        return
+    import httpx
+
+    host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434").strip()
+    if not host.startswith("http"):
+        host = f"http://{host}"
+    model = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+    try:
+        httpx.post(f"{host.rstrip('/')}/api/generate",
+                   json={"model": model, "keep_alive": 0}, timeout=15)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -266,11 +276,11 @@ app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
 @app.middleware("http")
 async def reject_bad_uploads_early(request: Request, call_next):
-    """Checks the access code and the declared size BEFORE the upload body is read,
+    """Checks the login and the declared size BEFORE the upload body is read,
     so strangers and oversized files are turned away cheaply."""
     if request.method == "POST" and request.url.path == "/jobs":
-        if _role(request.headers.get("x-access-code")) is None:
-            return JSONResponse({"detail": "Wrong or missing access code."}, status_code=401)
+        if user_from_authorization(request.headers.get("authorization")) is None:
+            return JSONResponse({"detail": "Please sign in to continue."}, status_code=401)
         declared = request.headers.get("content-length")
         if declared and declared.isdigit() and int(declared) > (MAX_UPLOAD_MB + 5) * 1024 * 1024:
             return JSONResponse(
@@ -284,8 +294,8 @@ async def reject_bad_uploads_early(request: Request, call_next):
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 
@@ -297,17 +307,13 @@ def health_check():
 @app.get("/config")
 def public_config():
     """What the website needs to know before showing the upload form."""
-    return {
-        "requires_code": bool(ACCESS_CODE),
-        "accepts_code": bool(ACCESS_CODE or OWNER_CODE),
-        "max_upload_mb": MAX_UPLOAD_MB,
-    }
+    return {"max_upload_mb": MAX_UPLOAD_MB}
 
 
 @app.post("/jobs", status_code=202)
-async def create_job(file: UploadFile, x_access_code: str | None = Header(default=None)):
-    role = _check_access(x_access_code)
+async def create_job(file: UploadFile, participants: str = Form(""), user: dict = Depends(current_user)):
     _purge_old_jobs()
+    names = clean_participants(participants)
 
     filename = os.path.basename(file.filename or "recording")
     extension = Path(filename).suffix.lower()
@@ -317,6 +323,11 @@ async def create_job(file: UploadFile, x_access_code: str | None = Header(defaul
     with jobs_lock:
         if len(pending) >= MAX_QUEUED_JOBS:
             raise HTTPException(status_code=503, detail="The server is busy right now. Please try again in a few minutes.")
+        active = sum(1 for j in jobs.values()
+                     if j["user"]["id"] == user["id"] and j["status"] in ("queued", "running"))
+        if active >= MAX_JOBS_PER_USER:
+            raise HTTPException(status_code=429, detail="You already have a recording being processed. "
+                                                        "Please wait for it to finish (refresh the page to see its progress).")
 
     job_id = uuid.uuid4().hex
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -347,14 +358,18 @@ async def create_job(file: UploadFile, x_access_code: str | None = Header(defaul
         raise HTTPException(status_code=500, detail="Could not save the upload. Please try again.")
 
     with work_available:
-        if len(pending) >= MAX_QUEUED_JOBS:
+        # Checked again: other uploads may have been accepted while this one was uploading.
+        active = sum(1 for j in jobs.values()
+                     if j["user"]["id"] == user["id"] and j["status"] in ("queued", "running"))
+        if len(pending) >= MAX_QUEUED_JOBS or active >= MAX_JOBS_PER_USER:
             destination.unlink(missing_ok=True)
             raise HTTPException(status_code=503, detail="The server is busy right now. Please try again in a few minutes.")
         jobs[job_id] = {
             "status": "queued",
             "stage": "waiting",
-            "integrations": role == "owner",
+            "user": {"id": user["id"], "email": user["email"]},
             "filename": filename,
+            "participants": names,
             "path": str(destination),
             "created": time.time(),
             "finished": None,
@@ -364,22 +379,34 @@ async def create_job(file: UploadFile, x_access_code: str | None = Header(defaul
         pending.append(job_id)
         work_available.notify()
 
-    return {"job_id": job_id, "integrations": role == "owner"}
+    return {"job_id": job_id}
+
+
+@app.get("/jobs/active")
+def get_active_job(user: dict = Depends(current_user)):
+    """The user's recording that is waiting or being processed, if any. The website calls this
+    when it opens, so closing the tab (or refreshing) does not lose track of a running job.
+    Declared before /jobs/{job_id} so "active" is not read as a job id."""
+    with jobs_lock:
+        for job_id, job in jobs.items():
+            if job["user"]["id"] == user["id"] and job["status"] in ("queued", "running"):
+                return {"job_id": job_id, "filename": job["filename"],
+                        "status": job["status"], "stage": job["stage"]}
+    return {"job_id": None}
 
 
 @app.get("/jobs/{job_id}")
-def get_job(job_id: str, x_access_code: str | None = Header(default=None)):
-    _check_access(x_access_code)
+def get_job(job_id: str, user: dict = Depends(current_user)):
     _purge_old_jobs()
 
     with jobs_lock:
         job = jobs.get(job_id)
-        if job is None:
+        # Someone else's job looks exactly like a job that does not exist.
+        if job is None or job["user"]["id"] != user["id"]:
             raise HTTPException(status_code=404, detail="This job was not found. It may have expired.")
         payload = {
             "status": job["status"],
             "stage": job["stage"],
-            "integrations": job["integrations"],
             "queue_position": (list(pending).index(job_id) + 1) if job_id in pending else 0,
         }
         if job["status"] == "done":
@@ -389,10 +416,113 @@ def get_job(job_id: str, x_access_code: str | None = Header(default=None)):
     return payload
 
 
+# ---------------------------------------------------------------------------
+# Meeting history
+# ---------------------------------------------------------------------------
+
+@app.get("/meetings")
+def list_meetings(user: dict = Depends(current_user)):
+    rows = db.list_meetings(user["id"])
+    return [
+        {
+            "id": r["id"],
+            "filename": r["filename"],
+            "created_at": r["created_at"],
+            "summary": (r.get("result") or {}).get("summary"),
+            "task_count": len((r.get("result") or {}).get("tasks") or []),
+        }
+        for r in rows
+    ]
+
+
+@app.get("/meetings/{meeting_id}")
+def get_meeting(meeting_id: str, user: dict = Depends(current_user)):
+    row = db.get_meeting(user["id"], meeting_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Meeting not found.")
+    return row
+
+
+@app.delete("/meetings/{meeting_id}", status_code=204)
+def delete_meeting(meeting_id: str, user: dict = Depends(current_user)):
+    db.delete_meeting(user["id"], meeting_id)
+
+
+# ---------------------------------------------------------------------------
+# Connections (each user's own Google / Notion / Slack)
+# ---------------------------------------------------------------------------
+
+class GoogleConnection(BaseModel):
+    refresh_token: str
+
+
+class NotionConnection(BaseModel):
+    token: str
+    database_id: str
+
+
+class SlackConnection(BaseModel):
+    webhook_url: str
+
+
+@app.get("/connections")
+def list_connections(user: dict = Depends(current_user)):
+    connected = db.get_connections(user["id"])
+    return {provider: provider in connected for provider in db.PROVIDERS}
+
+
+@app.put("/connections/google", status_code=204)
+def connect_google(body: GoogleConnection, user: dict = Depends(current_user)):
+    token = body.refresh_token.strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="Missing Google refresh token.")
+    db.save_connection(user["id"], "google", {"refresh_token": token})
+
+
+@app.put("/connections/notion", status_code=204)
+def connect_notion(body: NotionConnection, user: dict = Depends(current_user)):
+    token, database_id = body.token.strip(), body.database_id.strip()
+    if not token or not database_id:
+        raise HTTPException(status_code=400, detail="Enter both the Notion token and the database ID.")
+    # Accept a pasted database URL too: .../My-Tasks-<32 hex chars>?v=...
+    if "/" in database_id or "?" in database_id:
+        import re
+        found = re.findall(r"[0-9a-fA-F]{32}", database_id.replace("-", ""))
+        if not found:
+            raise HTTPException(status_code=400, detail="That does not look like a Notion database ID or link.")
+        database_id = found[-1]
+    connection = {"token": token, "database_id": database_id}
+    try:
+        check_notion(connection)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    db.save_connection(user["id"], "notion", connection)
+
+
+@app.put("/connections/slack", status_code=204)
+def connect_slack(body: SlackConnection, user: dict = Depends(current_user)):
+    url = body.webhook_url.strip()
+    # Only Slack's own webhook addresses: stops this server being used to call arbitrary URLs.
+    if not url.startswith("https://hooks.slack.com/"):
+        raise HTTPException(status_code=400, detail="Enter a Slack incoming webhook URL "
+                                                    "(it starts with https://hooks.slack.com/).")
+    connection = {"webhook_url": url}
+    try:
+        send_slack_test(connection)  # posts a test message, so the user sees at once that it works
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    db.save_connection(user["id"], "slack", connection)
+
+
+@app.delete("/connections/{provider}", status_code=204)
+def disconnect(provider: str, user: dict = Depends(current_user)):
+    if provider not in db.PROVIDERS:
+        raise HTTPException(status_code=404, detail="Unknown connection.")
+    db.delete_connection(user["id"], provider)
+
+
 # Serve the built website from the same address (must be last, after the API routes).
+# Optional: with the website on Vercel this is normally not used.
 if (FRONTEND_DIST / "index.html").exists():
     app.mount("/", StaticFiles(directory=str(FRONTEND_DIST), html=True), name="frontend")
     print(f"[main] Serving the website from {FRONTEND_DIST}", flush=True)
-else:
-    print(f"[main] No built website found at {FRONTEND_DIST}. "
-          "Run 'npm run build' in the frontend folder to create it.", flush=True)

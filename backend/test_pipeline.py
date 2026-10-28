@@ -1,7 +1,10 @@
-import os
+"""Offline check of the task-structuring step (no accounts or network needed).
+Run from the backend folder:  python test_pipeline.py
+
+Testing the real Notion/Slack/Google delivery now needs a signed-in user's saved
+connections, so do that through the website (Connections > then upload a short recording)."""
+
 from task_agent import structure_tasks
-from automation_agent import push_to_notion, push_to_slack
-from google_agent import push_to_calendar, send_summary_email
 
 sample_output = '''
 {
@@ -13,8 +16,5 @@ sample_output = '''
 '''
 
 if __name__ == "__main__":
-    tasks = structure_tasks(sample_output)
-    push_to_notion(tasks)
-    push_to_slack(tasks)
-    push_to_calendar(tasks)
-    send_summary_email(os.getenv("EMAIL_RECIPIENTS", ""), "Meeting Summary", "Here are today's action items.")
+    for task in structure_tasks(sample_output):
+        print(task)

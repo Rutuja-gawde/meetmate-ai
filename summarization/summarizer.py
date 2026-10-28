@@ -1,3 +1,4 @@
+import os
 import sys
 import ollama
 import json
@@ -68,7 +69,8 @@ def choose_context_size(prompt: str) -> int:
             return size
     return 32768
 
-def summarize_transcript(transcript: str, model: str = "llama3.1:8b", retries: int = 2) -> dict:
+def summarize_transcript(transcript: str, model: str | None = None, retries: int = 2) -> dict:
+    model = model or os.getenv("OLLAMA_MODEL", "llama3.1:8b")
     prompt = build_prompt(transcript)
     num_ctx = choose_context_size(prompt)
 
@@ -82,7 +84,7 @@ def summarize_transcript(transcript: str, model: str = "llama3.1:8b", retries: i
             ],
             format="json",
             options={"temperature": 0.1, "num_ctx": num_ctx, "num_predict": 2048},
-            keep_alive="30m",  # keep the model loaded so the next meeting starts faster
+            keep_alive="10m",  # keep the model loaded so the next meeting starts faster
         )
         raw = response["message"]["content"]
         try:

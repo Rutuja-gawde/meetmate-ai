@@ -23,6 +23,10 @@ Settings (optional, put them in the transcription/.env file):
                                    # internet check so runs do not wait on slow Wi-Fi
     RUN_MODELS_TOGETHER=           # optional: 1 = diarization and Whisper at the same
                                    # time, 0 = one after the other (default: automatic)
+    WHISPER_BATCHED=               # optional: 1 = batched Whisper on the GPU, usually 2-4x faster.
+                                   # Off by default: compare the transcript with and without it
+                                   # before trusting it for your languages.
+    WHISPER_BATCH_SIZE=8           # only with WHISPER_BATCHED=1; lower it if the GPU runs out of memory
     WHISPER_COMPUTE_TYPE=          # optional: leave empty for the most accurate setting
                                    # (float16 on a GPU). Use int8_float16 only if the GPU
                                    # runs out of memory.
@@ -50,11 +54,21 @@ from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline
 
 from speaker_name_mapper import extract_name_timeline, build_speaker_name_mapping
+from text_fixes import NameCorrector, clean_word
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 DEFAULT_MODEL = "large-v3-turbo"
+
+
+def participants_from_env() -> list[str]:
+    """The names typed on the website's upload form (MEETMATE_PARTICIPANTS="A|B|C").
+    Run by hand with no variable set, the three test names are used, as before."""
+    raw = os.environ.get("MEETMATE_PARTICIPANTS")
+    if raw is None:
+        return ["Jarvis", "Friday", "Edith"]
+    return [name.strip() for name in raw.split("|") if name.strip()]
 
 
 def gpu_memory_gb() -> float:
@@ -121,7 +135,7 @@ def convert_to_wav(input_path: str) -> str:
     return output_path
 
 
-def diarize_audio(audio_path: str, hf_token: str):
+def diarize_audio(audio_path: str, hf_token: str, num_speakers: int | None = None):
     started = time.perf_counter()
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -151,7 +165,10 @@ def diarize_audio(audio_path: str, hf_token: str):
         waveform = torch.from_numpy(audio_np).unsqueeze(0)
     else:
         waveform = torch.from_numpy(audio_np.T)
-    diarization = pipeline({"waveform": waveform, "sample_rate": sample_rate}, num_speakers=3)
+    # With the participants typed on the form the speaker count is known and the result is
+    # more accurate; without them the model works it out itself.
+    speaker_hint = {"num_speakers": num_speakers} if num_speakers else {}
+    diarization = pipeline({"waveform": waveform, "sample_rate": sample_rate}, **speaker_hint)
 
     speaker_turns = []
     if hasattr(diarization, "itertracks"):
@@ -183,7 +200,8 @@ def load_full_audio_mono(audio_path: str):
     return audio_np, sr
 
 
-def transcribe_full_audio(audio_path: str, model_size: str, language: str | None):
+def transcribe_full_audio(audio_path: str, model_size: str, language: str | None,
+                          participants: list[str] | None = None):
     """
     Transcribes the whole recording in one pass and returns word-level
     timestamps. One pass is much faster than transcribing every speaker turn
@@ -203,8 +221,7 @@ def transcribe_full_audio(audio_path: str, model_size: str, language: str | None
 
     print(f"[2/3] Transcribing {audio_seconds:.0f}s of audio...", flush=True)
     processing_started = time.perf_counter()
-    segments, info = model.transcribe(
-        audio,
+    options = dict(
         language=language,
         # With no fixed language, detect the language of every 30-second
         # window so mixed-language meetings are not forced into one language.
@@ -215,12 +232,38 @@ def transcribe_full_audio(audio_path: str, model_size: str, language: str | None
         vad_parameters={"min_silence_duration_ms": 500},
         condition_on_previous_text=False,      # avoids repeating loops on long audio
     )
+    segments = info = None
+    if device == "cuda" and (os.getenv("WHISPER_BATCHED") or "").strip() == "1":
+        try:
+            from faster_whisper import BatchedInferencePipeline
+            batch_size = int(os.getenv("WHISPER_BATCH_SIZE") or 8)
+            batched_options = {k: v for k, v in options.items() if k != "condition_on_previous_text"}
+            segments, info = BatchedInferencePipeline(model=model).transcribe(
+                audio, batch_size=batch_size, **batched_options)
+            print(f"[2/3] Using batched Whisper (batch size {batch_size}).", flush=True)
+        except Exception as e:
+            segments = info = None
+            print(f"[2/3] Batched Whisper is not available ({e}); using the normal mode.", flush=True)
+    if segments is None:
+        try:
+            segments, info = model.transcribe(audio, **options)
+        except TypeError:
+            # An older faster-whisper without the "multilingual" option: carry on without it.
+            options.pop("multilingual", None)
+            print("[2/3] This faster-whisper version has no 'multilingual' option; "
+                  "run: pip install -U faster-whisper", flush=True)
+            segments, info = model.transcribe(audio, **options)
 
+    # Devanagari -> Roman letters (set ROMANIZE_DEVANAGARI=0 to keep Whisper's own script),
+    # and near-miss spellings of the participants' names fixed to the form's spelling.
+    romanize = (os.getenv("ROMANIZE_DEVANAGARI") or "1").strip() != "0"
+    names = NameCorrector(participants)
     words = []
     count = 0
     for segment in segments:
         for w in segment.words or []:
-            words.append({"start": w.start, "end": w.end, "text": w.word})
+            text = clean_word(w.word, names, romanize)
+            words.append({"start": w.start, "end": w.end, "text": text})
         count += 1
         if count % 10 == 0:
             print(f"    ...transcribed {segment.end:.0f}s of {info.duration:.0f}s", flush=True)
@@ -232,17 +275,30 @@ def transcribe_full_audio(audio_path: str, model_size: str, language: str | None
     return words
 
 
-def identify_speaker_names(video_path: str):
+def identify_speaker_names(video_path: str, num_tiles: int = 3):
     """Runs the OCR step. Returns the active-speaker timeline, or [] on failure."""
     print("[OCR] Video track detected - looking for real speaker names...", flush=True)
     started = time.perf_counter()
     try:
-        timeline = extract_name_timeline(video_path, sample_interval=0.5)
+        timeline = extract_name_timeline(video_path, num_tiles=num_tiles, sample_interval=float(os.getenv("OCR_SAMPLE_INTERVAL", "1.0")))
         print(f"[time] Video name reading: {time.perf_counter() - started:.0f}s", flush=True)
         return timeline
     except Exception as e:
         print(f"[OCR] Name detection failed, falling back to generic labels: {e}", flush=True)
         return []
+
+
+_TIMELINE = {}
+_RUN_STARTED = time.perf_counter()
+
+
+def timed(name, fn, *args):
+    """Runs fn(*args) and records when it started and ended (seconds since the run began)."""
+    _TIMELINE[name] = [time.perf_counter() - _RUN_STARTED, None]
+    try:
+        return fn(*args)
+    finally:
+        _TIMELINE[name][1] = time.perf_counter() - _RUN_STARTED
 
 
 def get_overlap(a_start, a_end, b_start, b_end):
@@ -335,6 +391,12 @@ def main():
         print(f"ERROR: File not found: {original_path}")
         sys.exit(1)
 
+    participants = participants_from_env()
+    # The name reader assumes the people are shown in one row of equal-width tiles.
+    num_speakers = len(participants) if 2 <= len(participants) <= 8 else None
+    num_tiles = num_speakers if num_speakers and num_speakers <= 4 else 3
+    print(f"[info] Participants: {participants or 'not given (speakers are auto-detected)'}", flush=True)
+
     overall_started = time.perf_counter()
     if torch.cuda.is_available():
         gpu = torch.cuda.get_device_properties(0)
@@ -360,18 +422,22 @@ def main():
               f"{'at the same time' if together else 'one after the other'}.", flush=True)
 
         with ThreadPoolExecutor(max_workers=3) as pool:
-            ocr_job = pool.submit(identify_speaker_names, original_path) if has_video else None
+            ocr_job = pool.submit(timed, "video names", identify_speaker_names, original_path, num_tiles) if has_video else None
 
             if together:
-                diarization_job = pool.submit(diarize_audio, audio_path, hf_token)
-                transcription_job = pool.submit(transcribe_full_audio, audio_path, model_size, language)
+                diarization_job = pool.submit(timed, "speakers", diarize_audio, audio_path, hf_token, num_speakers)
+                transcription_job = pool.submit(timed, "whisper", transcribe_full_audio, audio_path, model_size, language, participants)
                 speaker_turns = diarization_job.result()
                 all_words = transcription_job.result()
             else:
-                speaker_turns = diarize_audio(audio_path, hf_token)
-                all_words = transcribe_full_audio(audio_path, model_size, language)
+                speaker_turns = timed("speakers", diarize_audio, audio_path, hf_token, num_speakers)
+                all_words = timed("whisper", transcribe_full_audio, audio_path, model_size, language, participants)
 
             name_timeline = ocr_job.result() if ocr_job else []
+
+        print("[time] Timeline (seconds since start): " + " | ".join(
+            f"{name} {start:.0f}-{end:.0f}" for name, (start, end) in _TIMELINE.items() if end is not None),
+            flush=True)
 
         # DEBUG: show each diarized speaker's total turns and durations
         speaker_durations = defaultdict(float)

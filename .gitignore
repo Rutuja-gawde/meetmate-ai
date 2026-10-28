@@ -40,3 +40,5 @@ temp_*
 frame_*.jpg
 backend-env/
 .venv/
+!.env.example
+!**/.env.example

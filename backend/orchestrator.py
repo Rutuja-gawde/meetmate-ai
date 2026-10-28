@@ -3,8 +3,11 @@ import shutil
 import subprocess
 
 # --- Paths to each part of the project --------------------------------------
-# Set MEETMATE_ROOT in backend/.env if the project is not in C:\MeetMate.
-PROJECT_ROOT = os.getenv("MEETMATE_ROOT", r"C:\MeetMate")
+# Defaults to the folder that contains backend/, transcription/ and summarization/,
+# so it works wherever the repo is cloned. Set MEETMATE_ROOT in backend/.env to override.
+PROJECT_ROOT = os.getenv("MEETMATE_ROOT") or os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__))
+)
 TRANSCRIPTION_DIR = os.path.join(PROJECT_ROOT, "transcription")
 SUMMARIZATION_DIR = os.path.join(PROJECT_ROOT, "summarization")
 
@@ -34,13 +37,17 @@ def _cleanup(paths) -> None:
             pass
 
 
-def run_transcription(audio_source_path: str, timeout_seconds: int = 3600) -> str:
+def run_transcription(audio_source_path: str, participants: list[str] | None = None,
+                      timeout_seconds: int = 3600) -> str:
     """Copies the uploaded audio into the transcription folder, runs transcribe_diarize.py
     and returns the transcript text.
 
     The Whisper model is NOT passed on the command line: transcribe_diarize.py picks it
     from WHISPER_MODEL in transcription/.env (default large-v3-turbo). Passing a model
     here would silently override that choice.
+
+    participants: names typed on the upload form (may be empty). They reach the script as
+    MEETMATE_PARTICIPANTS; an empty value means "unknown", and the script then auto-detects.
 
     timeout_seconds: hard ceiling so a stuck subprocess (e.g. a failed model download)
     fails loudly instead of hanging the request forever.
@@ -65,6 +72,7 @@ def run_transcription(audio_source_path: str, timeout_seconds: int = 3600) -> st
                 encoding="utf-8",
                 errors="replace",
                 timeout=timeout_seconds,
+                env={**os.environ, "MEETMATE_PARTICIPANTS": "|".join(participants or [])},
             )
         except subprocess.TimeoutExpired as e:
             raise RuntimeError(

@@ -1,44 +1,46 @@
 import os
 import base64
 import html
-import threading
 from datetime import datetime, timedelta
 from email.message import EmailMessage
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
+# Narrowest scopes that do the job: add events to the user's calendar and send mail as them.
+# The website asks for exactly these when the user signs in with Google.
 SCOPES = [
-    "https://www.googleapis.com/auth/calendar",
-    "https://www.googleapis.com/auth/gmail.send"
+    "https://www.googleapis.com/auth/calendar.events",
+    "https://www.googleapis.com/auth/gmail.send",
 ]
 
-# Calendar and email now run at the same time, so only one of them may
-# refresh or write token.json at once.
-_creds_lock = threading.Lock()
+TOKEN_URI = "https://oauth2.googleapis.com/token"
 
 
-def get_google_creds():
-    with _creds_lock:
-        creds = None
-        if os.path.exists("token.json"):
-            creds = Credentials.from_authorized_user_file("token.json", SCOPES)
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
-                flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-                creds = flow.run_local_server(port=0)
-            with open("token.json", "w") as token:
-                token.write(creds.to_json())
-        return creds
+def get_google_creds(google_conn: dict) -> Credentials:
+    """Builds credentials from the user's stored refresh token. The client id/secret are
+    the same Google OAuth client that Supabase uses for 'Sign in with Google'."""
+    client_id = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+    client_secret = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
+    if not client_id or not client_secret:
+        raise RuntimeError("GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET must be set in backend/.env")
+
+    creds = Credentials(
+        token=None,
+        refresh_token=google_conn["refresh_token"],
+        token_uri=TOKEN_URI,
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=SCOPES,
+    )
+    creds.refresh(Request())  # raises if the user revoked access
+    return creds
 
 
-def push_to_calendar(tasks, calendar_id="primary"):
-    creds = get_google_creds()
-    service = build("calendar", "v3", credentials=creds)
+def push_to_calendar(tasks, google_conn: dict, calendar_id="primary"):
+    creds = get_google_creds(google_conn)
+    service = build("calendar", "v3", credentials=creds, cache_discovery=False)
 
     created = 0
     for t in tasks:
@@ -182,7 +184,7 @@ def build_summary_email(meeting_title: str, summary_data: dict, tasks: list):
         {decisions_html}
         {tasks_html}
         <tr><td style="padding:28px 32px;font-size:12px;color:#8393a6;">
-          Sent automatically by MeetMate AI. Action items have also been added to Notion, Slack and Google Calendar where available.
+          Sent automatically by MeetMate AI. Action items were also sent to the apps you connected in MeetMate.
         </td></tr>
       </table>
     </td></tr>
@@ -199,14 +201,14 @@ def _normalize_recipients(recipients) -> list[str]:
     return [r.strip() for r in recipients if r and r.strip()]
 
 
-def send_summary_email(recipients, subject, body_text, body_html=None):
+def send_summary_email(recipients, subject, body_text, body_html, google_conn: dict):
     """recipients can be one address, a comma-separated string, or a list."""
     to_list = _normalize_recipients(recipients)
     if not to_list:
-        raise ValueError("No email recipients configured. Set EMAIL_RECIPIENTS in the backend .env file.")
+        raise ValueError("No email recipient: the signed-in account has no email address.")
 
-    creds = get_google_creds()
-    service = build("gmail", "v1", credentials=creds)
+    creds = get_google_creds(google_conn)
+    service = build("gmail", "v1", credentials=creds, cache_discovery=False)
 
     message = EmailMessage()
     message["To"] = ", ".join(to_list)

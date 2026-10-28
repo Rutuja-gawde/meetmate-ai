@@ -18,6 +18,8 @@ the layout changed. OCR also stops at the first confident match instead of
 trying every image variant.
 """
 
+import os
+
 import cv2
 import numpy as np
 import pytesseract
@@ -26,11 +28,22 @@ from difflib import SequenceMatcher
 
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
-# Adjust to your actual participants' real names/display names
-KNOWN_NAMES = ["Sushant", "Rutuja Gawde", "Shruti Gharat"]
+def load_participant_names():
+    """Names typed on the upload form arrive as MEETMATE_PARTICIPANTS ("A|B|C"). An empty value
+    means the user gave none, so nobody is named and speakers keep generic labels. Only when the
+    variable does not exist at all (running this script by hand) are the test names used."""
+    raw = os.environ.get("MEETMATE_PARTICIPANTS")
+    if raw is None:
+        return ["Jarvis", "Friday", "Edith"]
+    return [name.strip() for name in raw.split("|") if name.strip()]
+
+
+KNOWN_NAMES = load_participant_names()
 
 EARLY_EXIT_THRESHOLD = 0.75   # stop OCR variants as soon as one reads this well
-REVERIFY_EVERY = 20           # re-read a cached tile name every N samples
+REVERIFY_EVERY = 60           # re-read a cached tile name every N samples (tiles keep their names)
+GIVE_UP_AFTER = 12            # failed reads of one tile before we only retry it occasionally
+RETRY_EVERY = 5               # ...and then retry every N samples
 
 
 def split_into_tiles(frame, num_tiles=3):
@@ -175,6 +188,7 @@ def extract_name_timeline(video_path: str, num_tiles: int = 3, sample_interval: 
     frame_count = 0
     sampled_count = 0
     confirmed = {}   # tile index -> name confirmed by two matching OCR reads
+    failures = {}    # tile index -> consecutive OCR reads that matched no known name
     last_read = {}   # tile index -> most recent OCR match
     ocr_calls = 0
 
@@ -200,12 +214,34 @@ def extract_name_timeline(video_path: str, num_tiles: int = 3, sample_interval: 
                         active_index in confirmed
                         and sampled_count % REVERIFY_EVERY != 0
                     )
-                    if use_cache:
+                    # A name belongs to exactly one tile: when every tile but one is known
+                    # and the participant list has one name per tile, the last tile gets
+                    # the remaining name without any OCR.
+                    owners = {n: t for t, n in confirmed.items()}
+                    if (active_index not in confirmed and len(confirmed) == num_tiles - 1
+                            and len(KNOWN_NAMES) == num_tiles):
+                        left = [n for n in KNOWN_NAMES if n not in owners]
+                        if len(left) == 1:
+                            confirmed[active_index] = left[0]
+                            owners[left[0]] = active_index
+
+                    skip_ocr = (
+                        active_index not in confirmed
+                        and failures.get(active_index, 0) >= GIVE_UP_AFTER
+                        and sampled_count % RETRY_EVERY != 0
+                    )
+                    if use_cache and active_index in confirmed:
                         name = confirmed[active_index]
+                    elif skip_ocr:
+                        name = None
                     else:
                         ocr_calls += 1
                         raw_name = ocr_tile_name(tiles[active_index])
                         read = match_known_name(clean_name(raw_name))
+                        # Another tile already owns this name, so this read must be wrong.
+                        if read and owners.get(read, active_index) != active_index:
+                            read = None
+                        failures[active_index] = 0 if read else failures.get(active_index, 0) + 1
                         if read:
                             if last_read.get(active_index) == read:
                                 confirmed[active_index] = read
@@ -230,39 +266,71 @@ def extract_name_timeline(video_path: str, num_tiles: int = 3, sample_interval: 
 
 def build_speaker_name_mapping(speaker_turns, name_timeline, debug=True, min_win_ratio=0.5):
     """
-    min_win_ratio: the top name must have at least this fraction of that
-    speaker's total votes to be trusted. If the vote is too split/close
-    (common for speakers with short, frequent turns where cross-talk or
-    timing noise contaminates the sample), we fall back to leaving that
-    speaker unmapped (keeps the generic Speaker_XX label) rather than
-    risking a confidently-wrong name.
-    """
-    speaker_name_votes = {}
+    Decides which real name belongs to which diarization speaker (SPEAKER_00, ...).
 
+    Each speaker collects "votes": the names seen highlighted on screen while that
+    speaker's turns were playing. Rules:
+    - A name is given to AT MOST ONE speaker. (Before, two voices could both be called
+      "Sushant", and the transcript then merged them into one person.)
+    - The strongest speaker/name pair is settled first; the names it uses are removed from
+      the other speakers' votes, so a weaker speaker is judged on what is left.
+    - min_win_ratio: a name must hold at least this share of the speaker's remaining votes,
+      otherwise that speaker keeps the generic "Speaker XX" label rather than risk a
+      confidently wrong name.
+    - Elimination: if exactly one speaker and exactly one known participant are left over,
+      they are matched to each other.
+    """
+    tallies = {}
     for start, end, speaker in speaker_turns:
         for timestamp, name in name_timeline:
             if start <= timestamp <= end:
-                speaker_name_votes.setdefault(speaker, Counter())[name] += 1
+                tallies.setdefault(speaker, Counter())[name] += 1
+
+    all_speakers = sorted({speaker for _, _, speaker in speaker_turns})
 
     if debug:
         print("\n[DEBUG] Speaker vote tallies (which names were seen active during each speaker's turns):")
-        for speaker, votes in speaker_name_votes.items():
+        for speaker, votes in tallies.items():
             total = sum(votes.values())
             top_name, top_count = votes.most_common(1)[0]
-            ratio = top_count / total if total else 0
-            print(f"  {speaker}: {dict(votes)} -> top='{top_name}' ratio={ratio:.2f}")
-        speakers_with_no_votes = set(s for _, _, s in speaker_turns) - set(speaker_name_votes.keys())
-        if speakers_with_no_votes:
-            print(f"  (no OCR votes at all for: {speakers_with_no_votes})")
+            print(f"  {speaker}: {dict(votes)} -> top='{top_name}' ratio={top_count / total:.2f}")
+        silent = [s for s in all_speakers if s not in tallies]
+        if silent:
+            print(f"  (no OCR votes at all for: {set(silent)})")
 
     mapping = {}
-    for speaker, votes in speaker_name_votes.items():
-        top_name, top_count = votes.most_common(1)[0]
-        total = sum(votes.values())
-        ratio = top_count / total if total else 0
-        if ratio >= min_win_ratio:
-            mapping[speaker] = top_name
-        # else: leave unmapped, falls back to generic "Speaker XX" label
+    used_names = set()
+    while True:
+        best = None
+        for speaker, votes in tallies.items():
+            if speaker in mapping:
+                continue
+            available = {n: c for n, c in votes.items() if n not in used_names}
+            if not available:
+                continue
+            name, count = max(available.items(), key=lambda item: item[1])
+            ratio = count / sum(available.values())
+            if ratio < min_win_ratio:
+                continue
+            if best is None or (count, ratio) > best[0]:
+                best = ((count, ratio), speaker, name)
+        if best is None:
+            break
+        _, speaker, name = best
+        mapping[speaker] = name
+        used_names.add(name)
+
+    leftover_speakers = [s for s in all_speakers if s not in mapping]
+    leftover_names = [n for n in KNOWN_NAMES if n not in used_names]
+    if len(leftover_speakers) == 1 and len(leftover_names) == 1:
+        mapping[leftover_speakers[0]] = leftover_names[0]
+        if debug:
+            print(f"  (by elimination: {leftover_speakers[0]} -> {leftover_names[0]})")
+
+    if debug:
+        unmapped = [s for s in all_speakers if s not in mapping]
+        if unmapped:
+            print(f"  (left as generic labels: {unmapped})")
 
     return mapping
 

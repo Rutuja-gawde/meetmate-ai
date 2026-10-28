@@ -1,11 +1,11 @@
 import { useState, useEffect, useRef } from 'react'
 import './App.css'
-
-// In development the backend runs on its own address. In the built website the
-// backend serves the page itself, so requests use the same address.
-const API_URL = (
-  import.meta.env.VITE_API_URL ?? (import.meta.env.DEV ? 'http://localhost:8000' : '')
-).replace(/\/$/, '')
+import { API_URL, apiRequest, authHeaders } from './api'
+import { signOut } from './supabase'
+import { useSession } from './useSession'
+import Login from './Login'
+import Settings from './Settings'
+import History from './History'
 
 const STATUS_ICONS = {
   ok: '✓',
@@ -32,7 +32,7 @@ const PIPELINE_STEPS = [
   { key: 'uploading', label: 'Uploading the recording' },
   { key: 'transcribing', label: 'Transcribing and identifying speakers' },
   { key: 'summarizing', label: 'Writing the summary and tasks' },
-  { key: 'syncing', label: 'Syncing to Notion, Slack, Calendar and Gmail' },
+  { key: 'syncing', label: 'Sending results to your connected apps' },
 ]
 
 const ICONS = {
@@ -154,11 +154,12 @@ const parseTranscript = (text) =>
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 // Uploads with XMLHttpRequest because fetch cannot report upload progress.
-function uploadRecording(file, accessCode, onProgress) {
+async function uploadRecording(file, participants, onProgress) {
+  const headers = await authHeaders()
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest()
     xhr.open('POST', `${API_URL}/jobs`)
-    if (accessCode) xhr.setRequestHeader('X-Access-Code', accessCode)
+    Object.entries(headers).forEach(([name, value]) => xhr.setRequestHeader(name, value))
 
     xhr.upload.onprogress = (event) => {
       if (event.lengthComputable) onProgress(Math.round((event.loaded / event.total) * 100))
@@ -171,7 +172,7 @@ function uploadRecording(file, accessCode, onProgress) {
         // response wasn't JSON
       }
       if (xhr.status >= 200 && xhr.status < 300 && body.job_id) {
-        resolve({ jobId: body.job_id, integrations: Boolean(body.integrations) })
+        resolve({ jobId: body.job_id })
       } else if (xhr.status === 413) {
         reject(new Error(body.detail || 'This file is too large to upload.'))
       } else {
@@ -183,27 +184,30 @@ function uploadRecording(file, accessCode, onProgress) {
 
     const formData = new FormData()
     formData.append('file', file)
+    formData.append('participants', participants)
     xhr.send(formData)
   })
 }
 
-function readSavedCode() {
+const PARTICIPANTS_KEY = 'meetmate-participants'
+
+function readSavedParticipants() {
   try {
-    return sessionStorage.getItem('meetmate-access-code') || ''
+    return localStorage.getItem(PARTICIPANTS_KEY) || ''
   } catch {
     return ''
   }
 }
 
-function saveCode(code) {
+function saveParticipants(value) {
   try {
-    sessionStorage.setItem('meetmate-access-code', code)
+    localStorage.setItem(PARTICIPANTS_KEY, value)
   } catch {
-    // storage can be unavailable; the code just won't be remembered
+    // storage can be unavailable; the names just won't be remembered
   }
 }
 
-function App() {
+function Workspace({ session }) {
   const [file, setFile] = useState(null)
   const [loading, setLoading] = useState(false)
   const [result, setResult] = useState(null)
@@ -216,7 +220,9 @@ function App() {
   const [mediaUrl, setMediaUrl] = useState(null)
   const [serverConfig, setServerConfig] = useState(null)
   const [jobIntegrations, setJobIntegrations] = useState(false)
-  const [accessCode, setAccessCode] = useState(readSavedCode)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [viewedName, setViewedName] = useState(null)
+  const [participants, setParticipants] = useState(readSavedParticipants)
   const fileInputRef = useRef(null)
   const runIdRef = useRef(0)
 
@@ -280,43 +286,11 @@ function App() {
     if (dropped) resetFile(dropped)
   }
 
-  const handleUpload = async () => {
-    if (!file || !serverConfig) return
-
-    const maxBytes = serverConfig.max_upload_mb * 1024 * 1024
-    if (file.size > maxBytes) {
-      setError(
-        `This file is ${(file.size / (1024 * 1024)).toFixed(0)} MB, but the limit is ` +
-          `${serverConfig.max_upload_mb} MB. Try a shorter recording.`
-      )
-      return
-    }
-    if (serverConfig.requires_code && !accessCode.trim()) {
-      setError('Enter the access code to continue.')
-      return
-    }
-
-    const code = accessCode.trim()
-    const runId = ++runIdRef.current
+  // Polls the server until the job finishes. Used right after an upload and also when the
+  // page opens while a job is already running (closed tab, refresh).
+  const followJob = async (jobId, runId) => {
     const stillCurrent = () => runIdRef.current === runId
-
-    setLoading(true)
-    setError(null)
-    setPhase('uploading')
-    setUploadPercent(0)
-    setQueuePosition(0)
-    setJobIntegrations(false)
-
     try {
-      const { jobId, integrations } = await uploadRecording(file, code, (percent) => {
-        if (stillCurrent()) setUploadPercent(percent)
-      })
-      if (!stillCurrent()) return
-      setJobIntegrations(integrations)
-      saveCode(code)
-      setPhase('queued')
-
-      const headers = code ? { 'X-Access-Code': code } : {}
       let failures = 0
       while (stillCurrent()) {
         await sleep(2000)
@@ -324,7 +298,7 @@ function App() {
 
         let response
         try {
-          response = await fetch(`${API_URL}/jobs/${jobId}`, { headers })
+          response = await fetch(`${API_URL}/jobs/${jobId}`, { headers: await authHeaders() })
         } catch {
           failures += 1
           if (failures >= 5) throw new Error('Lost connection to the server. Please try again.')
@@ -344,7 +318,6 @@ function App() {
         failures = 0
         const data = await response.json()
         setQueuePosition(data.queue_position || 0)
-        if (data.integrations !== undefined) setJobIntegrations(Boolean(data.integrations))
 
         if (data.status === 'queued') {
           setPhase('queued')
@@ -366,10 +339,82 @@ function App() {
     }
   }
 
+  // If a recording is still being processed (the tab was closed or refreshed), pick it up again.
+  useEffect(() => {
+    let cancelled = false
+    apiRequest('/jobs/active')
+      .then((active) => {
+        if (cancelled || !active?.job_id) return
+        const runId = ++runIdRef.current
+        setViewedName(active.filename)
+        setError(null)
+        setLoading(true)
+        setPhase(active.status === 'queued' ? 'queued' : active.stage || 'transcribing')
+        apiRequest('/connections')
+          .then((connected) => {
+            if (runIdRef.current === runId) setJobIntegrations(Object.values(connected).some(Boolean))
+          })
+          .catch(() => {})
+        followJob(active.job_id, runId)
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const handleUpload = async () => {
+    if (!file || !serverConfig) return
+
+    const maxBytes = serverConfig.max_upload_mb * 1024 * 1024
+    if (file.size > maxBytes) {
+      setError(
+        `This file is ${(file.size / (1024 * 1024)).toFixed(0)} MB, but the limit is ` +
+          `${serverConfig.max_upload_mb} MB. Try a shorter recording.`
+      )
+      return
+    }
+
+    const runId = ++runIdRef.current
+    const stillCurrent = () => runIdRef.current === runId
+
+    setViewedName(null)
+    setLoading(true)
+    setError(null)
+    setPhase('uploading')
+    setUploadPercent(0)
+    setQueuePosition(0)
+    setJobIntegrations(false)
+
+    try {
+      saveParticipants(participants)
+      const { jobId } = await uploadRecording(file, participants.trim(), (percent) => {
+        if (stillCurrent()) setUploadPercent(percent)
+      })
+      if (!stillCurrent()) return
+      // The "sending results" step only shows if the user has connected at least one app.
+      apiRequest('/connections')
+        .then((connected) => {
+          if (stillCurrent()) setJobIntegrations(Object.values(connected).some(Boolean))
+        })
+        .catch(() => {})
+      setPhase('queued')
+
+      await followJob(jobId, runId)
+    } catch (err) {
+      if (stillCurrent()) {
+        setError(err.message)
+        setLoading(false)
+      }
+    }
+  }
+
   const handleNewMeeting = () => {
     runIdRef.current += 1 // stops any upload/polling still in progress
     setLoading(false)
     setFile(null)
+    setViewedName(null)
     setResult(null)
     setError(null)
     if (fileInputRef.current) fileInputRef.current.value = ''
@@ -379,7 +424,8 @@ function App() {
     if (!result) return
 
     const generatedAt = new Date().toLocaleString()
-    const reportTitle = `MeetMate Report - ${file?.name || 'Meeting'}`
+    const recordingName = file?.name || viewedName || 'Meeting'
+    const reportTitle = `MeetMate Report - ${recordingName}`
 
     const renderList = (items, tag = 'ul') =>
       items?.length
@@ -426,7 +472,7 @@ function App() {
 </head>
 <body>
   <h1>MeetMate AI - Meeting Report</h1>
-  <div class="meta">Recording: ${escapeHtml(file?.name || 'unknown')} &middot; Generated: ${escapeHtml(generatedAt)}</div>
+  <div class="meta">Recording: ${escapeHtml(recordingName)} &middot; Generated: ${escapeHtml(generatedAt)}</div>
 
   <h2>Summary</h2>
   <p>${escapeHtml(result.summary || 'No summary available.')}</p>
@@ -491,8 +537,19 @@ function App() {
             </span>
             MeetMate AI
           </div>
+          <div className="account">
+            <span className="account-email">{session.user?.email}</span>
+            <button className="btn btn-small" onClick={() => setSettingsOpen(true)}>
+              Connections
+            </button>
+            <button className="btn btn-small" onClick={() => signOut()}>
+              Sign out
+            </button>
+          </div>
         </div>
       </header>
+
+      {settingsOpen && <Settings onClose={() => setSettingsOpen(false)} />}
 
       <main className="page">
         {!result && !loading && (
@@ -527,40 +584,23 @@ function App() {
                 </div>
               )}
 
-              {serverConfig?.accepts_code && (
-                <div style={{ width: '100%', maxWidth: 280, textAlign: 'left' }}>
-                  <label
-                    htmlFor="access-code"
-                    style={{
-                      display: 'block',
-                      marginBottom: 6,
-                      fontSize: '0.85rem',
-                      fontWeight: 600,
-                      color: 'var(--ink-soft)',
-                    }}
-                  >
-                    {serverConfig.requires_code ? 'Access code' : 'Access code (optional)'}
-                  </label>
-                  <input
-                    id="access-code"
-                    type="password"
-                    autoComplete="off"
-                    value={accessCode}
-                    onChange={(e) => setAccessCode(e.target.value)}
-                    style={{
-                      width: '100%',
-                      minHeight: 42,
-                      padding: '0 14px',
-                      border: '1px solid var(--line)',
-                      borderRadius: 10,
-                      font: 'inherit',
-                      fontSize: '0.92rem',
-                      background: '#fff',
-                      color: 'var(--ink)',
-                    }}
-                  />
-                </div>
-              )}
+              <div className="participants-field">
+                <label htmlFor="participants">Who is in this meeting? (optional)</label>
+                <input
+                  id="participants"
+                  className="field"
+                  type="text"
+                  autoComplete="off"
+                  maxLength={300}
+                  placeholder="e.g. Jarvis, Friday, Edith"
+                  value={participants}
+                  onChange={(e) => setParticipants(e.target.value)}
+                />
+                <p className="field-hint">
+                  Separate names with commas, spelled as they appear on the video. This helps spell
+                  names correctly and tells MeetMate how many speakers to look for.
+                </p>
+              </div>
 
               <div className="dropzone-actions">
                 <label className="btn">
@@ -588,6 +628,15 @@ function App() {
                 WAV or M4A.
               </p>
             </div>
+
+            <History
+              onOpen={(meeting) => {
+                setFile(null)
+                setViewedName(meeting.filename)
+                setResult(meeting.result)
+                setError(null)
+              }}
+            />
           </>
         )}
 
@@ -646,7 +695,7 @@ function App() {
             )}
             {phase !== 'queued' && (
               <p className="processing-note">
-                Long meetings can take several minutes. Keep this tab open until it finishes.
+                Long meetings can take several minutes. You can close this page: the meeting keeps processing and appears under Your past meetings.
               </p>
             )}
           </div>
@@ -670,7 +719,7 @@ function App() {
                       <Icon name="check" size={14} />
                       Processed
                     </span>
-                    {file && <span className="meta-file">{file.name}</span>}
+                    {(file || viewedName) && <span className="meta-file">{file?.name || viewedName}</span>}
                     {file && <span>{formatFileSize(file.size)}</span>}
                   </div>
                 </div>
@@ -701,6 +750,22 @@ function App() {
                       </span>
                     </div>
                   ))}
+                </div>
+              )}
+
+              {result.automation_status?.some((item) => item.status !== 'ok') && (
+                <div className="sync-problems">
+                  {result.automation_status
+                    .filter((item) => item.status !== 'ok')
+                    .map((item) => (
+                      <p key={item.step}>
+                        <strong>{STATUS_LABELS[item.step] || item.step}:</strong>{' '}
+                        {item.status === 'timed_out'
+                          ? 'took too long and was skipped.'
+                          : item.error || 'something went wrong.'}
+                      </p>
+                    ))}
+                  <p>Check the connection under Connections, then process the meeting again.</p>
                 </div>
               )}
             </section>
@@ -832,4 +897,25 @@ function App() {
   )
 }
 
-export default App
+export default function App() {
+  const session = useSession()
+  if (session === undefined) return null // still checking whether the user is signed in
+  if (!session) {
+    return (
+      <>
+        <header className="topbar">
+          <div className="topbar-inner">
+            <div className="brand">
+              <span className="brand-mark">
+                <Icon name="wave" size={20} />
+              </span>
+              MeetMate AI
+            </div>
+          </div>
+        </header>
+        <Login />
+      </>
+    )
+  }
+  return <Workspace session={session} key={session.user.id} />
+}
